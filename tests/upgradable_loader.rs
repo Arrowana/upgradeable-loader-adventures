@@ -297,6 +297,12 @@ fn trailing_system_transfer_keeps_upgraded_buffer_tombstoned() -> Result<()> {
         &upgrade_buffer.pubkey(),
         Some(upgrade_authority.pubkey()),
     )?;
+    match parse_loader_state(&tombstoned_buffer.data)? {
+        UpgradeableLoaderState::Buffer { authority_address } => {
+            assert_eq!(authority_address, Some(upgrade_authority.pubkey()));
+        }
+        other => bail!("expected Buffer, found {other:?}"),
+    }
 
     Ok(())
 }
