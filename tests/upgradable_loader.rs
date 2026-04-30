@@ -307,6 +307,61 @@ fn trailing_system_transfer_keeps_upgraded_buffer_tombstoned() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn upgrade_then_sets_buffer_authority_to_pda() -> Result<()> {
+    let validator = TestValidator::start()?;
+    let client = validator.rpc_client();
+    let payer = Keypair::new();
+    let upgrade_buffer = Keypair::new();
+    let upgrade_authority = test_upgrade_authority()?;
+    let program = test_program_id();
+    let program_bytes = memo_program_bytes()?;
+    let (pda_authority, _) =
+        Pubkey::find_program_address(&[b"arbitrary-buffer-authority"], &program);
+
+    airdrop(&client, &payer, AIRDROP_LAMPORTS)?;
+
+    create_buffer(
+        &client,
+        &payer,
+        &upgrade_buffer,
+        &upgrade_authority.pubkey(),
+        program_bytes.len(),
+    )?;
+    write_buffer(
+        &client,
+        &payer,
+        &upgrade_buffer.pubkey(),
+        &upgrade_authority,
+        &program_bytes,
+    )?;
+
+    let upgrade_ix = loader_instruction::upgrade(
+        &program,
+        &upgrade_buffer.pubkey(),
+        &upgrade_authority.pubkey(),
+        &payer.pubkey(),
+    );
+    let set_authority_ix = loader_instruction::set_buffer_authority(
+        &upgrade_buffer.pubkey(),
+        &upgrade_authority.pubkey(),
+        &pda_authority,
+    );
+
+    send_tx(
+        &client,
+        &payer,
+        &[&payer, &upgrade_authority],
+        vec![upgrade_ix, set_authority_ix],
+    )?;
+
+    client
+        .get_account(&upgrade_buffer.pubkey())
+        .expect_err("upgraded buffer should be gone after being drained to zero lamports");
+
+    Ok(())
+}
+
 fn airdrop(client: &RpcClient, payer: &Keypair, lamports: u64) -> Result<()> {
     let signature = client
         .request_airdrop(&payer.pubkey(), lamports)
