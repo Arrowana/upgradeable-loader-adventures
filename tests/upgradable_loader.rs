@@ -1,216 +1,82 @@
 use {
     anyhow::{anyhow, bail, Context, Result},
-    bincode::deserialize,
-    solana_commitment_config::CommitmentConfig,
-    solana_keypair::{read_keypair_file, Keypair},
+    bincode::{deserialize, serialize},
+    litesvm::{types::FailedTransactionMetadata, LiteSVM},
+    solana_keypair::Keypair,
     solana_loader_v3_interface::{
-        instruction as loader_instruction, instruction::UpgradeableLoaderInstruction,
-        state::UpgradeableLoaderState,
+        get_program_data_address, instruction as loader_instruction,
+        instruction::UpgradeableLoaderInstruction, state::UpgradeableLoaderState,
     },
     solana_pubkey::{Pubkey, Pubkey as Address},
-    solana_rpc_client::rpc_client::RpcClient,
-    solana_rpc_client_api::{
-        client_error::{Error as RpcClientError, ErrorKind},
-        request::{RpcError, RpcResponseErrorData},
-    },
     solana_sdk_ids::bpf_loader_upgradeable,
     solana_signer::Signer,
     solana_system_interface::instruction as system_instruction,
     solana_transaction::{Instruction, Transaction},
-    std::{
-        fs,
-        io::Read,
-        net::TcpListener,
-        path::PathBuf,
-        process::{Child, Command, Stdio},
-        thread::sleep,
-        time::{Duration, Instant},
-    },
-    tempfile::TempDir,
+    std::{fs, path::PathBuf},
 };
 
 const AIRDROP_LAMPORTS: u64 = 10_000_000_000;
 const WRITE_CHUNK_LEN: usize = 700;
 
-struct TestValidator {
-    child: Child,
-    _ledger_dir: TempDir,
-    rpc_url: String,
-}
-
-impl TestValidator {
-    fn start() -> Result<Self> {
-        let ledger_dir = TempDir::new().context("create validator ledger dir")?;
-        let rpc_listener = TcpListener::bind("127.0.0.1:0").context("bind ephemeral rpc port")?;
-        let rpc_port = rpc_listener
-            .local_addr()
-            .context("read ephemeral rpc port")?
-            .port();
-        let rpc_ws_port = rpc_port
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("rpc websocket port overflow for {rpc_port}"))?;
-        drop(rpc_listener);
-
-        let faucet_port = loop {
-            let faucet_listener =
-                TcpListener::bind("127.0.0.1:0").context("bind ephemeral faucet port")?;
-            let port = faucet_listener
-                .local_addr()
-                .context("read ephemeral faucet port")?
-                .port();
-            if port != rpc_port && port != rpc_ws_port {
-                drop(faucet_listener);
-                break port;
-            }
-        };
-        let gossip_port = loop {
-            let gossip_listener =
-                TcpListener::bind("127.0.0.1:0").context("bind ephemeral gossip port")?;
-            let port = gossip_listener
-                .local_addr()
-                .context("read ephemeral gossip port")?
-                .port();
-            if port != rpc_port && port != rpc_ws_port && port != faucet_port {
-                drop(gossip_listener);
-                break port;
-            }
-        };
-        let rpc_url = format!("http://127.0.0.1:{rpc_port}");
-        let program_id = test_program_id();
-        let memo_program_path = memo_program_path();
-        let upgrade_authority_path = test_upgrade_authority_path();
-
-        let mut child = Command::new("solana-test-validator")
-            .arg("--reset")
-            .arg("--quiet")
-            .arg("--ledger")
-            .arg(ledger_dir.path())
-            .arg("--bind-address")
-            .arg("127.0.0.1")
-            .arg("--gossip-port")
-            .arg(gossip_port.to_string())
-            .arg("--rpc-port")
-            .arg(rpc_port.to_string())
-            .arg("--faucet-port")
-            .arg(faucet_port.to_string())
-            .arg("--upgradeable-program")
-            .arg(program_id.to_string())
-            .arg(&memo_program_path)
-            .arg(&upgrade_authority_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawn solana-test-validator")?;
-
-        let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::processed());
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if client.get_latest_blockhash().is_ok() {
-                break;
-            }
-
-            if let Some(status) = child.try_wait().context("poll solana-test-validator")? {
-                let mut stderr = String::new();
-                if let Some(mut handle) = child.stderr.take() {
-                    let _ = handle.read_to_string(&mut stderr);
-                }
-                bail!(
-                    "solana-test-validator exited early with status {status}: {}",
-                    stderr.trim()
-                );
-            }
-
-            if Instant::now() >= deadline {
-                bail!("timed out waiting for solana-test-validator at {rpc_url}");
-            }
-
-            sleep(Duration::from_millis(250));
-        }
-
-        Ok(Self {
-            child,
-            _ledger_dir: ledger_dir,
-            rpc_url,
-        })
-    }
-
-    fn rpc_client(&self) -> RpcClient {
-        RpcClient::new_with_commitment(self.rpc_url.clone(), CommitmentConfig::processed())
-    }
-}
-
-impl Drop for TestValidator {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
 #[test]
 fn closed_buffer_can_be_reused_after_close() -> Result<()> {
-    let validator = TestValidator::start()?;
-    let client = validator.rpc_client();
+    let (mut svm, _) = test_svm()?;
     let payer = Keypair::new();
     let buffer = Keypair::new();
     let program_bytes = memo_program_bytes()?;
 
-    airdrop(&client, &payer, AIRDROP_LAMPORTS)?;
+    airdrop(&mut svm, &payer, AIRDROP_LAMPORTS)?;
 
     create_buffer(
-        &client,
+        &mut svm,
         &payer,
         &buffer,
         &payer.pubkey(),
         program_bytes.len(),
     )?;
-    assert_buffer_authority(&client, &buffer.pubkey(), Some(payer.pubkey()))?;
+    assert_buffer_authority(&svm, &buffer.pubkey(), Some(payer.pubkey()))?;
 
     let close_ix = loader_instruction::close(&buffer.pubkey(), &payer.pubkey(), &payer.pubkey());
-    send_tx(&client, &payer, &[&payer], vec![close_ix])?;
+    send_tx(&mut svm, &payer, &[&payer], vec![close_ix])?;
 
     create_buffer(
-        &client,
+        &mut svm,
         &payer,
         &buffer,
         &payer.pubkey(),
         program_bytes.len(),
     )?;
-    assert_buffer_authority(&client, &buffer.pubkey(), Some(payer.pubkey()))?;
+    assert_buffer_authority(&svm, &buffer.pubkey(), Some(payer.pubkey()))?;
 
     Ok(())
 }
 
 #[test]
 fn close_with_lamports_for_rent_exemption_tombstones_the_buffer() -> Result<()> {
-    let validator = TestValidator::start()?;
-    let client = validator.rpc_client();
+    let (mut svm, _) = test_svm()?;
     let payer = Keypair::new();
     let buffer = Keypair::new();
     let program_bytes = memo_program_bytes()?;
 
-    airdrop(&client, &payer, AIRDROP_LAMPORTS)?;
+    airdrop(&mut svm, &payer, AIRDROP_LAMPORTS)?;
 
     create_buffer(
-        &client,
+        &mut svm,
         &payer,
         &buffer,
         &payer.pubkey(),
         program_bytes.len(),
     )?;
     let zero_authority = Address::default();
-    let buffer_rent = client
-        .get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_buffer(
-            program_bytes.len(),
-        ))
-        .context("fetch recreated buffer rent exemption")?;
+    let buffer_rent = svm.minimum_balance_for_rent_exemption(
+        UpgradeableLoaderState::size_of_buffer(program_bytes.len()),
+    );
     let close_ix = loader_instruction::close(&buffer.pubkey(), &payer.pubkey(), &payer.pubkey());
     let transfer_ix = system_instruction::transfer(&payer.pubkey(), &buffer.pubkey(), buffer_rent);
 
-    send_tx(&client, &payer, &[&payer], vec![close_ix, transfer_ix])?;
+    send_tx(&mut svm, &payer, &[&payer], vec![close_ix, transfer_ix])?;
 
-    let buffer_account = client.get_account(&buffer.pubkey()).with_context(|| {
+    let buffer_account = svm.get_account(&buffer.pubkey()).with_context(|| {
         format!(
             "fetch buffer after failed atomic reinitialize {}",
             buffer.pubkey()
@@ -231,34 +97,32 @@ fn close_with_lamports_for_rent_exemption_tombstones_the_buffer() -> Result<()> 
         ],
     );
 
-    let err = send_tx(&client, &payer, &[&payer], vec![initialize_ix])
+    let err = send_tx_result(&mut svm, &payer, &[&payer], vec![initialize_ix])
         .expect_err("InitializeBuffer should fail on truncated account");
-    assert_preflight_log_contains(&err, "account data too small for instruction");
+    assert_transaction_log_contains(&err, "account data too small for instruction");
 
     Ok(())
 }
 
 #[test]
 fn trailing_system_transfer_keeps_upgraded_buffer_tombstoned() -> Result<()> {
-    let validator = TestValidator::start()?;
-    let client = validator.rpc_client();
+    let (mut svm, upgrade_authority) = test_svm()?;
     let payer = Keypair::new();
     let upgrade_buffer = Keypair::new();
-    let upgrade_authority = test_upgrade_authority()?;
     let program = test_program_id();
     let program_bytes = memo_program_bytes()?;
 
-    airdrop(&client, &payer, AIRDROP_LAMPORTS)?;
+    airdrop(&mut svm, &payer, AIRDROP_LAMPORTS)?;
 
     create_buffer(
-        &client,
+        &mut svm,
         &payer,
         &upgrade_buffer,
         &upgrade_authority.pubkey(),
         program_bytes.len(),
     )?;
     write_buffer(
-        &client,
+        &mut svm,
         &payer,
         &upgrade_buffer.pubkey(),
         &upgrade_authority,
@@ -271,20 +135,19 @@ fn trailing_system_transfer_keeps_upgraded_buffer_tombstoned() -> Result<()> {
         &upgrade_authority.pubkey(),
         &payer.pubkey(),
     );
-    let reinstate_rent = client
-        .get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_buffer(0))
-        .context("fetch zero-length buffer rent exemption")?;
+    let reinstate_rent =
+        svm.minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_buffer(0));
     let transfer_ix =
         system_instruction::transfer(&payer.pubkey(), &upgrade_buffer.pubkey(), reinstate_rent);
 
     send_tx(
-        &client,
+        &mut svm,
         &payer,
         &[&payer, &upgrade_authority],
         vec![upgrade_ix, transfer_ix],
     )?;
 
-    let tombstoned_buffer = client
+    let tombstoned_buffer = svm
         .get_account(&upgrade_buffer.pubkey())
         .with_context(|| format!("fetch tombstoned buffer {}", upgrade_buffer.pubkey()))?;
     assert_eq!(tombstoned_buffer.lamports, reinstate_rent);
@@ -293,7 +156,7 @@ fn trailing_system_transfer_keeps_upgraded_buffer_tombstoned() -> Result<()> {
         UpgradeableLoaderState::size_of_buffer(0),
     );
     assert_buffer_authority(
-        &client,
+        &svm,
         &upgrade_buffer.pubkey(),
         Some(upgrade_authority.pubkey()),
     )?;
@@ -309,27 +172,25 @@ fn trailing_system_transfer_keeps_upgraded_buffer_tombstoned() -> Result<()> {
 
 #[test]
 fn upgrade_then_sets_buffer_authority_to_pda() -> Result<()> {
-    let validator = TestValidator::start()?;
-    let client = validator.rpc_client();
+    let (mut svm, upgrade_authority) = test_svm()?;
     let payer = Keypair::new();
     let upgrade_buffer = Keypair::new();
-    let upgrade_authority = test_upgrade_authority()?;
     let program = test_program_id();
     let program_bytes = memo_program_bytes()?;
     let (pda_authority, _) =
         Pubkey::find_program_address(&[b"arbitrary-buffer-authority"], &program);
 
-    airdrop(&client, &payer, AIRDROP_LAMPORTS)?;
+    airdrop(&mut svm, &payer, AIRDROP_LAMPORTS)?;
 
     create_buffer(
-        &client,
+        &mut svm,
         &payer,
         &upgrade_buffer,
         &upgrade_authority.pubkey(),
         program_bytes.len(),
     )?;
     write_buffer(
-        &client,
+        &mut svm,
         &payer,
         &upgrade_buffer.pubkey(),
         &upgrade_authority,
@@ -349,39 +210,78 @@ fn upgrade_then_sets_buffer_authority_to_pda() -> Result<()> {
     );
 
     send_tx(
-        &client,
+        &mut svm,
         &payer,
         &[&payer, &upgrade_authority],
         vec![upgrade_ix, set_authority_ix],
     )?;
 
-    client
-        .get_account(&upgrade_buffer.pubkey())
-        .expect_err("upgraded buffer should be gone after being drained to zero lamports");
+    assert!(
+        svm.get_account(&upgrade_buffer.pubkey()).is_none(),
+        "upgraded buffer should be gone after being drained to zero lamports"
+    );
 
     Ok(())
 }
 
-fn airdrop(client: &RpcClient, payer: &Keypair, lamports: u64) -> Result<()> {
-    let signature = client
-        .request_airdrop(&payer.pubkey(), lamports)
-        .context("request airdrop")?;
-    client
-        .poll_for_signature(&signature)
-        .context("confirm airdrop")?;
+fn test_svm() -> Result<(LiteSVM, Keypair)> {
+    let mut svm = LiteSVM::new();
+    let program_id = test_program_id();
+    let upgrade_authority = Keypair::new();
+
+    svm.add_program(program_id, &memo_program_bytes()?)
+        .context("add upgradeable memo program")?;
+    set_program_upgrade_authority(&mut svm, program_id, upgrade_authority.pubkey())?;
+    svm.warp_to_slot(1);
+
+    Ok((svm, upgrade_authority))
+}
+
+fn set_program_upgrade_authority(
+    svm: &mut LiteSVM,
+    program_id: Pubkey,
+    authority: Pubkey,
+) -> Result<()> {
+    let programdata_address = get_program_data_address(&program_id);
+    let mut programdata_account = svm
+        .get_account(&programdata_address)
+        .with_context(|| format!("fetch ProgramData account {programdata_address}"))?;
+    let metadata_len = UpgradeableLoaderState::size_of_programdata_metadata();
+    let metadata = parse_loader_state(&programdata_account.data)?;
+    let slot = match metadata {
+        UpgradeableLoaderState::ProgramData { slot, .. } => slot,
+        other => bail!("expected ProgramData account, found {other:?}"),
+    };
+
+    let mut data = serialize(&UpgradeableLoaderState::ProgramData {
+        slot,
+        upgrade_authority_address: Some(authority),
+    })
+    .context("serialize ProgramData metadata")?;
+    data.extend_from_slice(&programdata_account.data[metadata_len..]);
+    programdata_account.data = data;
+
+    svm.set_account(programdata_address, programdata_account)
+        .context("set ProgramData authority")?;
+
     Ok(())
+}
+
+fn airdrop(svm: &mut LiteSVM, payer: &Keypair, lamports: u64) -> Result<()> {
+    svm.airdrop(&payer.pubkey(), lamports)
+        .map(|_| ())
+        .map_err(|err| anyhow!("airdrop failed: {err:?}"))
 }
 
 fn create_buffer(
-    client: &RpcClient,
+    svm: &mut LiteSVM,
     payer: &Keypair,
     buffer: &Keypair,
     authority: &Pubkey,
     program_len: usize,
 ) -> Result<()> {
-    let lamports = client
-        .get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_buffer(program_len))
-        .context("fetch buffer rent exemption")?;
+    let lamports =
+        svm.minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_buffer(program_len));
     let instructions = loader_instruction::create_buffer(
         &payer.pubkey(),
         &buffer.pubkey(),
@@ -390,12 +290,12 @@ fn create_buffer(
         program_len,
     )
     .context("build create_buffer instructions")?;
-    send_tx(client, payer, &[payer, buffer], instructions)?;
+    send_tx(svm, payer, &[payer, buffer], instructions)?;
     Ok(())
 }
 
 fn write_buffer(
-    client: &RpcClient,
+    svm: &mut LiteSVM,
     payer: &Keypair,
     buffer: &Pubkey,
     authority: &Keypair,
@@ -416,59 +316,49 @@ fn write_buffer(
         } else {
             vec![payer, authority]
         };
-        send_tx(client, payer, &signers, vec![write_ix])?;
+        send_tx(svm, payer, &signers, vec![write_ix])?;
     }
     Ok(())
 }
 
 fn send_tx(
-    client: &RpcClient,
+    svm: &mut LiteSVM,
     payer: &Keypair,
     signers: &[&Keypair],
     instructions: Vec<Instruction>,
 ) -> Result<()> {
-    let blockhash = client
-        .get_latest_blockhash()
-        .context("fetch latest blockhash")?;
+    send_tx_result(svm, payer, signers, instructions)
+        .map_err(|err| anyhow!("send transaction failed: {err:?}"))
+}
+
+fn send_tx_result(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    signers: &[&Keypair],
+    instructions: Vec<Instruction>,
+) -> std::result::Result<(), FailedTransactionMetadata> {
+    let blockhash = svm.latest_blockhash();
     let tx = Transaction::new_signed_with_payer(
         &instructions,
         Some(&payer.pubkey()),
         signers,
         blockhash,
     );
-    client
-        .send_and_confirm_transaction(&tx)
-        .map(|_| ())
-        .context("send transaction")
+    svm.send_transaction(tx).map(|_| {
+        svm.expire_blockhash();
+    })
 }
 
-fn assert_preflight_log_contains(err: &anyhow::Error, needle: &str) {
-    let rpc_err = err
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<RpcClientError>())
-        .expect("missing rpc client error");
-
-    let logs = match rpc_err.kind() {
-        ErrorKind::RpcError(RpcError::RpcResponseError {
-            data: RpcResponseErrorData::SendTransactionPreflightFailure(result),
-            ..
-        }) => result.logs.as_deref().unwrap_or(&[]),
-        other => panic!("expected preflight failure, found {other:?}"),
-    };
-
+fn assert_transaction_log_contains(err: &FailedTransactionMetadata, needle: &str) {
     assert!(
-        logs.iter().any(|log| log.contains(needle)),
+        err.meta.logs.iter().any(|log| log.contains(needle)),
         "missing log {needle:?}\nlogs:\n{}",
-        logs.join("\n"),
+        err.meta.logs.join("\n"),
     );
 }
 
-fn assert_buffer_authority(
-    client: &RpcClient,
-    buffer: &Pubkey,
-    expected: Option<Pubkey>,
-) -> Result<()> {
-    let account = client
+fn assert_buffer_authority(svm: &LiteSVM, buffer: &Pubkey, expected: Option<Pubkey>) -> Result<()> {
+    let account = svm
         .get_account(buffer)
         .with_context(|| format!("fetch buffer account {buffer}"))?;
     match parse_loader_state(&account.data)? {
@@ -511,15 +401,6 @@ fn test_program_id() -> Pubkey {
 
 fn memo_program_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("memo.so")
-}
-
-fn test_upgrade_authority_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-upgrade-authority.json")
-}
-
-fn test_upgrade_authority() -> Result<Keypair> {
-    read_keypair_file(test_upgrade_authority_path())
-        .map_err(|err| anyhow!("read test upgrade authority: {err}"))
 }
 
 fn memo_program_bytes() -> Result<Vec<u8>> {
